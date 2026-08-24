@@ -137,21 +137,23 @@ class SegmentationWorker(QThread):
 
 class ICPRegistrationWorker(QThread):
     """
-    Asynchronous Worker for rigid Iterative Closest Point (ICP) registration
-    of intraoral optical scans (IOS) onto CBCT tooth surfaces.
+    Asynchronous Worker for Robust Two-Stage Rigid Surface Registration:
+      Stage 1: Global PCA Pre-Alignment & 4-Quadrant ambiguity search.
+      Stage 2: Fine Trimmed ICP (vtkIterativeClosestPointTransform + 15% Outlier Rejection).
     """
 
-    progress_updated = Signal(int, str)                                # percentage (0-100), message
-    registration_complete = Signal(object, object, float, int)         # aligned_poly, 4x4 matrix, rms_error, num_iters
-    error_occurred = Signal(str)                                       # error message
+    progress_updated = Signal(int, str)                                       # percentage (0-100), message
+    registration_complete = Signal(object, object, float, int, float, str)    # aligned_poly, matrix, rms, iters, max_95th, status
+    error_occurred = Signal(str)                                              # error message
 
     def __init__(
         self,
         source_poly: vtk.vtkPolyData,
         target_poly: vtk.vtkPolyData,
-        max_iterations: int = 150,
-        max_landmarks: int = 2000,
-        tolerance: float = 1e-6,
+        max_iterations: int = 200,
+        max_landmarks: int = 2500,
+        tolerance: float = 0.001,
+        trim_ratio: float = 0.15,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -163,6 +165,7 @@ class ICPRegistrationWorker(QThread):
         self.max_iterations = max_iterations
         self.max_landmarks = max_landmarks
         self.tolerance = tolerance
+        self.trim_ratio = trim_ratio
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -170,31 +173,40 @@ class ICPRegistrationWorker(QThread):
         self._is_cancelled = True
 
     def run(self) -> None:
-        """Executes the rigid ICP optimization pipeline off the GUI thread."""
+        """Executes the two-stage registration pipeline off the GUI thread."""
         try:
-            self.progress_updated.emit(10, "Initializing ICP optimizer (Centroid Pre-Alignment)...")
+            self.progress_updated.emit(10, "Stage 1: Computing Principal Component Analysis (PCA) & Centroids...")
 
             if self._is_cancelled:
                 return
 
-            self.progress_updated.emit(30, f"Optimizing rigid 6-DoF alignment ({self.max_iterations} max iterations)...")
+            self.progress_updated.emit(25, "Stage 1: Evaluating 4-Quadrant rotation candidates (Chamfer metric)...")
+
+            if self._is_cancelled:
+                return
+
+            self.progress_updated.emit(50, f"Stage 2: Running Fine Rigid ICP ({self.max_iterations} iters, {self.max_landmarks} landmarks)...")
 
             engine = MeshRegistrationEngine()
-            aligned_pd, transform_np, rms_error, num_iters = engine.register_icp_transform(
+            aligned_pd, transform_np, rms_error, num_iters, max_95, quality_status = engine.register_icp_transform(
                 source=self.source_poly,
                 target=self.target_poly,
                 max_iterations=self.max_iterations,
                 max_landmarks=self.max_landmarks,
                 tolerance=self.tolerance,
+                trim_ratio=self.trim_ratio,
             )
 
             if self._is_cancelled:
                 return
 
-            self.progress_updated.emit(90, f"Evaluating residual surface metric (RMS: {rms_error:.4f} mm)...")
-            self.progress_updated.emit(100, f"Alignment converged in {num_iters} iterations.")
+            self.progress_updated.emit(85, "Stage 2: Applying 15% distance trimming (gingival outlier rejection)...")
+            self.progress_updated.emit(95, f"Quality evaluation: {quality_status} (RMS: {rms_error:.4f} mm, 95%: {max_95:.4f} mm)...")
+            self.progress_updated.emit(100, f"Registration complete ({quality_status}).")
 
-            self.registration_complete.emit(aligned_pd, transform_np, rms_error, num_iters)
+            self.registration_complete.emit(
+                aligned_pd, transform_np, rms_error, num_iters, max_95, quality_status
+            )
 
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {str(exc)}\n\n{traceback.format_exc()}"

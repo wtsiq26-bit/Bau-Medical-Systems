@@ -1041,13 +1041,32 @@ class ControlPanel(QWidget):
         self.lbl_ios_op_val.setText(f"{value}%")
         self.signals.ios_opacity_changed.emit(opacity)
 
-    def update_icp_status(self, rms: float, iterations: int) -> None:
-        """Update the ICP alignment status label after registration."""
-        self.lbl_icp_status.setText(
-            f"✅ RMS: {rms:.4f} mm  |  Iterations: {iterations}"
-        )
+    def update_icp_status(
+        self,
+        rms: float,
+        iterations: int,
+        quality_status: str = "EXCELLENT",
+        max_95th: Optional[float] = None,
+    ) -> None:
+        """Update the ICP alignment status label with clinical quality metrics."""
+        color_map = {
+            "EXCELLENT": "#4ade80",   # Green
+            "ACCEPTABLE": "#a3e635",  # Lime
+            "WARNING": "#fbbf24",     # Amber
+            "FAILED": "#f87171",      # Red
+        }
+        badge_color = color_map.get(quality_status, "#4ade80")
+        icon = "✅" if quality_status in ("EXCELLENT", "ACCEPTABLE") else ("⚠️" if quality_status == "WARNING" else "❌")
+
+        status_text = f"{icon} RMS: {rms:.3f} mm [{quality_status}]"
+        if max_95th is not None:
+            status_text += f"\n   95%: {max_95th:.3f} mm | Iters: {iterations}"
+        else:
+            status_text += f" | {iterations} iters"
+
+        self.lbl_icp_status.setText(status_text)
         self.lbl_icp_status.setStyleSheet(
-            "color: #4ade80; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: bold;"
+            f"color: {badge_color}; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: bold;"
         )
 
     def set_icp_button_enabled(self, enabled: bool) -> None:

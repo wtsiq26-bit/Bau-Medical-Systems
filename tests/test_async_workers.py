@@ -105,7 +105,7 @@ def test_icp_registration_worker_execution(qapp):
 
     worker.progress_updated.connect(lambda pct, msg: progress_events.append((pct, msg)))
     worker.registration_complete.connect(
-        lambda poly, mat, rms, iters: reg_results.append((poly, mat, rms, iters))
+        lambda poly, mat, rms, iters, max_95, status: reg_results.append((poly, mat, rms, iters, max_95, status))
     )
     worker.error_occurred.connect(lambda err: errors.append(err))
 
@@ -116,11 +116,12 @@ def test_icp_registration_worker_execution(qapp):
 
     assert len(errors) == 0, f"Worker error: {errors}"
     assert len(reg_results) == 1
-    aligned_poly, transform_mat, rms, num_iters = reg_results[0]
+    aligned_poly, transform_mat, rms, num_iters, max_95, status = reg_results[0]
 
     assert aligned_poly.GetNumberOfPoints() == source_poly.GetNumberOfPoints()
     assert transform_mat.shape == (4, 4)
     assert rms < 1.0  # Spheres should converge with minimal residual
+    assert status in ("EXCELLENT", "ACCEPTABLE")
 
 
 def test_panoramic_worker_execution(qapp):

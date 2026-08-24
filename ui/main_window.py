@@ -886,6 +886,8 @@ class MainWindow(QMainWindow):
         transform_matrix: np.ndarray,
         rms_error: float,
         num_iterations: int,
+        max_error_95th: float = 0.0,
+        quality_status: str = "EXCELLENT",
     ) -> None:
         """Invoked on Main Thread with computed registration data."""
         self.loading_dialog.hide()
@@ -897,10 +899,12 @@ class MainWindow(QMainWindow):
         self.viewport_grid.volume_view.add_ios_scan_actor(aligned_actor, aligned_poly)
 
         # Update UI status
-        self.control_panel.update_icp_status(rms_error, num_iterations)
+        self.control_panel.update_icp_status(
+            rms_error, num_iterations, quality_status=quality_status, max_95th=max_error_95th
+        )
         self.status_bar.showMessage(
-            f"ICP alignment converged — RMS: {rms_error:.4f} mm, "
-            f"Iterations: {num_iterations}",
+            f"Two-Stage ICP converged [{quality_status}] — RMS: {rms_error:.4f} mm, "
+            f"95%: {max_error_95th:.4f} mm ({num_iterations} iters)",
             8000,
         )
 
