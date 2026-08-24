@@ -74,6 +74,12 @@ class ControlPanelSignals(QObject):
     ios_visibility_changed = Signal(bool)             # show/hide IOS scan
     ios_opacity_changed = Signal(float)               # IOS opacity [0..1]
 
+    # 3D Surgical Guide Fabrication Signals
+    generate_guide_clicked = Signal(float, float)     # thickness_mm, clearance_mm
+    export_guide_clicked = Signal()                   # save .stl file
+    guide_visibility_changed = Signal(bool)           # show/hide guide mesh
+    guide_opacity_changed = Signal(float)             # guide opacity [0..1]
+
 
 class SectionCard(QFrame):
     """Styled collapsible-style clinical card container."""
@@ -175,7 +181,10 @@ class ControlPanel(QWidget):
         # 8. 3D AI Segmentation & Mesh Alignment Card
         self._build_segmentation_section()
 
-        # 9. Diagnostic Tools & Measurement Card
+        # 9. 3D Surgical Guide Fabrication Card
+        self._build_surgical_guide_section()
+
+        # 10. Diagnostic Tools & Measurement Card
         self._build_tools_section()
 
         self.content_layout.addStretch()
@@ -1072,6 +1081,126 @@ class ControlPanel(QWidget):
     def set_icp_button_enabled(self, enabled: bool) -> None:
         """Enable/disable ICP button (requires both teeth and IOS loaded)."""
         self.btn_icp_align.setEnabled(enabled)
+
+    def _build_surgical_guide_section(self) -> None:
+        """Builds 3D Printable Surgical Guide Fabrication Card."""
+        card = SectionCard("3D Surgical Guide Fabrication", self)
+
+        # Thickness Slider
+        lbl_th = QLabel("Guide Base Thickness:")
+        lbl_th.setStyleSheet("color: #b9cacb; font-size: 11px;")
+        card.layout.addWidget(lbl_th)
+
+        row_th = QHBoxLayout()
+        self.slider_guide_th = QSlider(Qt.Horizontal)
+        self.slider_guide_th.setRange(20, 40)   # 2.0 - 4.0 mm
+        self.slider_guide_th.setValue(30)       # 3.0 mm
+        row_th.addWidget(self.slider_guide_th, 1)
+
+        self.lbl_guide_th_val = QLabel("3.0 mm")
+        self.lbl_guide_th_val.setStyleSheet("color: #ffbf00; font-family: 'JetBrains Mono'; font-size: 11px; font-weight: bold;")
+        row_th.addWidget(self.lbl_guide_th_val)
+        card.layout.addLayout(row_th)
+
+        self.slider_guide_th.valueChanged.connect(
+            lambda v: self.lbl_guide_th_val.setText(f"{v / 10.0:.1f} mm")
+        )
+
+        # Sleeve Clearance Slider
+        lbl_cl = QLabel("Drill Sleeve Clearance:")
+        lbl_cl.setStyleSheet("color: #b9cacb; font-size: 11px;")
+        card.layout.addWidget(lbl_cl)
+
+        row_cl = QHBoxLayout()
+        self.slider_guide_cl = QSlider(Qt.Horizontal)
+        self.slider_guide_cl.setRange(5, 25)    # 0.5 - 2.5 mm
+        self.slider_guide_cl.setValue(12)       # 1.2 mm
+        row_cl.addWidget(self.slider_guide_cl, 1)
+
+        self.lbl_guide_cl_val = QLabel("1.2 mm")
+        self.lbl_guide_cl_val.setStyleSheet("color: #ffbf00; font-family: 'JetBrains Mono'; font-size: 11px; font-weight: bold;")
+        row_cl.addWidget(self.lbl_guide_cl_val)
+        card.layout.addLayout(row_cl)
+
+        self.slider_guide_cl.valueChanged.connect(
+            lambda v: self.lbl_guide_cl_val.setText(f"{v / 10.0:.1f} mm")
+        )
+
+        # Generate & Export Buttons
+        self.btn_generate_guide = QPushButton("⚡ Generate 3D Surgical Guide")
+        self.btn_generate_guide.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #f59e0b);
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f59e0b, stop:1 #fbbf24);
+            }
+            QPushButton:disabled {
+                background-color: #262b2e;
+                color: #555e62;
+            }
+        """)
+        self.btn_generate_guide.clicked.connect(self._on_generate_guide_clicked)
+        card.layout.addWidget(self.btn_generate_guide)
+
+        self.btn_export_guide = QPushButton("💾 Export Guide (.STL)")
+        self.btn_export_guide.setEnabled(False)
+        self.btn_export_guide.setStyleSheet("""
+            QPushButton {
+                background-color: #1f2937;
+                color: #ffbf00;
+                border: 1px solid #d97706;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #374151;
+            }
+            QPushButton:disabled {
+                background-color: #1a1e21;
+                border: 1px solid #262b2e;
+                color: #555e62;
+            }
+        """)
+        self.btn_export_guide.clicked.connect(self.signals.export_guide_clicked.emit)
+        card.layout.addWidget(self.btn_export_guide)
+
+        # Visibility Checkbox
+        self.chk_show_guide = QCheckBox("Show Surgical Guide (Amber)")
+        self.chk_show_guide.setChecked(True)
+        self.chk_show_guide.setStyleSheet("color: #ffbf00; font-size: 11px; font-weight: bold;")
+        self.chk_show_guide.toggled.connect(self.signals.guide_visibility_changed.emit)
+        card.layout.addWidget(self.chk_show_guide)
+
+        # Status & Metrics Label
+        self.lbl_guide_status = QLabel("Ready (No guide generated)")
+        self.lbl_guide_status.setStyleSheet("color: #849495; font-family: 'JetBrains Mono'; font-size: 10px;")
+        card.layout.addWidget(self.lbl_guide_status)
+
+        self.content_layout.addWidget(card)
+
+    def _on_generate_guide_clicked(self) -> None:
+        th = self.slider_guide_th.value() / 10.0
+        cl = self.slider_guide_cl.value() / 10.0
+        self.signals.generate_guide_clicked.emit(th, cl)
+
+    def update_guide_status(self, volume_cm3: float, area_cm2: float, num_implants: int) -> None:
+        """Update guide metrics badge after fabrication."""
+        self.btn_export_guide.setEnabled(True)
+        self.lbl_guide_status.setText(
+            f"✅ Guide Fabricated ({num_implants} implants)\n"
+            f"   Resin: {volume_cm3:.2f} cm³ | Area: {area_cm2:.1f} cm²"
+        )
+        self.lbl_guide_status.setStyleSheet(
+            "color: #ffbf00; font-family: 'JetBrains Mono'; font-size: 10px; font-weight: bold;"
+        )
 
     def _build_tools_section(self) -> None:
         """Builds Diagnostic Tools & Caliper buttons."""

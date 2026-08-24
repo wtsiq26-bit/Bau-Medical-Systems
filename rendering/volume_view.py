@@ -48,6 +48,8 @@ class VolumeView(QFrame):
         self._mesh_polydatas: Dict[str, vtk.vtkPolyData] = {}
         self._ios_actor: Optional[vtk.vtkActor] = None
         self._ios_polydata: Optional[vtk.vtkPolyData] = None
+        self._guide_actor: Optional[vtk.vtkActor] = None
+        self._guide_polydata: Optional[vtk.vtkPolyData] = None
 
         self.setObjectName("volume_view_3d")
         self.setFrameStyle(QFrame.NoFrame)
@@ -411,6 +413,40 @@ class VolumeView(QFrame):
             self._ios_actor.GetProperty().SetOpacity(max(0.0, min(1.0, opacity)))
             self.safe_render()
 
+    def add_surgical_guide_actor(
+        self,
+        actor: vtk.vtkActor,
+        polydata: Optional[vtk.vtkPolyData] = None,
+    ) -> None:
+        """Add the 3D surgical guide actor to the 3D renderer."""
+        if self._guide_actor is not None:
+            self.renderer.RemoveActor(self._guide_actor)
+
+        self._guide_actor = actor
+        self._guide_polydata = polydata
+        self.renderer.AddActor(actor)
+        self.safe_render()
+
+    def remove_surgical_guide_actor(self) -> None:
+        """Remove the 3D surgical guide actor from the renderer."""
+        if self._guide_actor is not None:
+            self.renderer.RemoveActor(self._guide_actor)
+            self._guide_actor = None
+            self._guide_polydata = None
+            self.safe_render()
+
+    def set_surgical_guide_visibility(self, visible: bool) -> None:
+        """Toggle visibility of the 3D surgical guide overlay."""
+        if self._guide_actor is not None:
+            self._guide_actor.SetVisibility(visible)
+            self.safe_render()
+
+    def set_surgical_guide_opacity(self, opacity: float) -> None:
+        """Adjust opacity of the 3D surgical guide overlay."""
+        if self._guide_actor is not None:
+            self._guide_actor.GetProperty().SetOpacity(max(0.0, min(1.0, opacity)))
+            self.safe_render()
+
     def safe_render(self) -> None:
         """Safely executes Render only when viewport has valid dimensions and is visible."""
         if hasattr(self, 'vtkWidget') and self.vtkWidget is not None:
@@ -439,6 +475,14 @@ class VolumeView(QFrame):
                 pass
             self._ios_actor = None
             self._ios_polydata = None
+
+        if self._guide_actor is not None:
+            try:
+                self.renderer.RemoveActor(self._guide_actor)
+            except Exception:
+                pass
+            self._guide_actor = None
+            self._guide_polydata = None
 
         if hasattr(self, 'orientation_widget') and self.orientation_widget is not None:
             try:

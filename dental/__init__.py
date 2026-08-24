@@ -25,6 +25,10 @@ from dental.mesh_registration import (
     MeshRegistrationEngine,
     RegistrationResult,
 )
+from dental.surgical_guide import (
+    SurgicalGuideGenerator,
+    SurgicalGuideResult,
+)
 
 __all__ = [
     "NerveTracer",
@@ -47,4 +51,6 @@ __all__ = [
     "CoordinateAlignmentError",
     "MeshRegistrationEngine",
     "RegistrationResult",
+    "SurgicalGuideGenerator",
+    "SurgicalGuideResult",
 ]

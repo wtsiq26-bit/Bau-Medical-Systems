@@ -282,3 +282,89 @@ class PanoramicWorker(QThread):
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {str(exc)}\n\n{traceback.format_exc()}"
             self.error_occurred.emit(err_msg)
+
+
+# ---------------------------------------------------------------------------
+# 4. Surgical Guide Generator Worker Thread
+# ---------------------------------------------------------------------------
+
+class SurgicalGuideWorker(QThread):
+    """
+    Asynchronous Worker for 3D Printable Surgical Guide CAD Generation:
+    - Base shell offset and solid manifold closure.
+    - Parametric drill sleeve housing extrusion.
+    - Boolean CSG drill channel subtraction and irrigation slot carving.
+    - Mesh decimation and SLA/DLP 3D print validation.
+    """
+
+    progress_updated = Signal(int, str)              # percentage (0-100), message
+    guide_generated = Signal(object, float, float)   # guide_polydata, volume_cm3, area_cm2
+    error_occurred = Signal(str)                     # error message
+
+    def __init__(
+        self,
+        base_surface: vtk.vtkPolyData,
+        implants: List[Any],
+        guide_thickness_mm: float = 3.0,
+        sleeve_clearance_mm: float = 1.2,
+        sleeve_outer_wall_mm: float = 2.0,
+        sleeve_height_mm: float = 6.0,
+        sleeve_offset_mm: float = 2.0,
+        include_irrigation_windows: bool = True,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.base_surface = vtk.vtkPolyData()
+        self.base_surface.DeepCopy(base_surface)
+        self.implants = implants
+        self.guide_thickness_mm = guide_thickness_mm
+        self.sleeve_clearance_mm = sleeve_clearance_mm
+        self.sleeve_outer_wall_mm = sleeve_outer_wall_mm
+        self.sleeve_height_mm = sleeve_height_mm
+        self.sleeve_offset_mm = sleeve_offset_mm
+        self.include_irrigation_windows = include_irrigation_windows
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        """Requests cancellation of the guide generation worker."""
+        self._is_cancelled = True
+
+    def run(self) -> None:
+        """Executes the CAD guide synthesis pipeline off the GUI thread."""
+        try:
+            from dental.surgical_guide import SurgicalGuideGenerator
+
+            self.progress_updated.emit(10, "Generating watertight anatomical guide base shell...")
+
+            if self._is_cancelled:
+                return
+
+            self.progress_updated.emit(35, f"Constructing {len(self.implants)} parametric metallic sleeve housings...")
+
+            if self._is_cancelled:
+                return
+
+            self.progress_updated.emit(60, "Executing Boolean CSG drill channel subtractions & irrigation windows...")
+
+            result = SurgicalGuideGenerator.generate_guide(
+                base_surface=self.base_surface,
+                implants=self.implants,
+                guide_thickness_mm=self.guide_thickness_mm,
+                sleeve_clearance_mm=self.sleeve_clearance_mm,
+                sleeve_outer_wall_mm=self.sleeve_outer_wall_mm,
+                sleeve_height_mm=self.sleeve_height_mm,
+                sleeve_offset_mm=self.sleeve_offset_mm,
+                include_irrigation_windows=self.include_irrigation_windows,
+            )
+
+            if self._is_cancelled:
+                return
+
+            self.progress_updated.emit(90, "Smoothing guide borders and validating SLA/DLP 3D print manifoldness...")
+            self.progress_updated.emit(100, f"Surgical guide ready (Resin volume: {result.volume_cm3:.2f} cm³).")
+
+            self.guide_generated.emit(result.guide_polydata, result.volume_cm3, result.surface_area_cm2)
+
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {str(exc)}\n\n{traceback.format_exc()}"
+            self.error_occurred.emit(err_msg)

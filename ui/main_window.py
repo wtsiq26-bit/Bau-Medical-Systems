@@ -28,7 +28,7 @@ from PySide6.QtGui import QIcon, QPixmap, QColor
 import vtk
 from core.volume_data import VolumeData
 from core.dicom_loader import DicomLoaderWorker
-from core.async_workers import SegmentationWorker, ICPRegistrationWorker
+from core.async_workers import SegmentationWorker, ICPRegistrationWorker, SurgicalGuideWorker
 from ui.viewport_grid import ViewportGrid
 from ui.control_panel import ControlPanel
 from ui.series_sidebar import SeriesSidebar
@@ -36,6 +36,7 @@ from ui.ribbon_toolbar import RibbonToolbar
 from ui.styles import BAU_DARK_THEME
 from dental.surface_extractor import SurfaceExtractor, STRUCTURE_PRESETS
 from dental.mesh_registration import MeshRegistrationEngine
+from dental.surgical_guide import SurgicalGuideGenerator, SurgicalGuideResult
 
 
 class LoadingProgressDialog(QDialog):
@@ -112,8 +113,10 @@ class MainWindow(QMainWindow):
         # 3D Segmentation & Mesh Alignment state
         self._seg_worker: Optional[SegmentationWorker] = None
         self._icp_worker: Optional[ICPRegistrationWorker] = None
-        self._ios_polydata: Optional[vtk.vtkPolyData] = None          # Loaded IOS vtkPolyData (pre-alignment)
-        self._ios_raw_polydata: Optional[vtk.vtkPolyData] = None      # Unaligned copy for re-registration
+        self._guide_worker: Optional[SurgicalGuideWorker] = None
+        self._ios_raw_polydata: Optional[vtk.vtkPolyData] = None
+        self._surgical_guide_polydata: Optional[vtk.vtkPolyData] = None
+
         self._seg_structures: dict = {}                               # {id: vtkPolyData} from extraction
         self._has_ios_loaded: bool = False
         self._has_teeth_extracted: bool = False
@@ -366,7 +369,17 @@ class MainWindow(QMainWindow):
             self.viewport_grid.volume_view.set_ios_opacity
         )
 
-        # 13. Status Bar Updates
+        # 13. 3D Surgical Guide Fabrication Signals
+        self.control_panel.signals.generate_guide_clicked.connect(self._on_generate_surgical_guide)
+        self.control_panel.signals.export_guide_clicked.connect(self._on_export_surgical_guide)
+        self.control_panel.signals.guide_visibility_changed.connect(
+            self.viewport_grid.volume_view.set_surgical_guide_visibility
+        )
+        self.control_panel.signals.guide_opacity_changed.connect(
+            self.viewport_grid.volume_view.set_surgical_guide_opacity
+        )
+
+        # 14. Status Bar Updates
         self.viewport_grid.signals.crosshair_moved.connect(self._update_status_coords)
         self.viewport_grid.signals.hu_inspected.connect(self._update_status_hu)
         self.viewport_grid.signals.measurement_completed.connect(self._on_measurement_completed)
@@ -920,6 +933,143 @@ class MainWindow(QMainWindow):
         )
         self.status_bar.showMessage("ICP alignment failed.", 5000)
 
+    def _on_generate_surgical_guide(self, thickness_mm: float, clearance_mm: float) -> None:
+        """Launches background CAD synthesis of the 3D printable surgical guide."""
+        # 1. Verify planned implants exist
+        implant_mgr = getattr(self.viewport_grid, 'implant_manager', None)
+        if implant_mgr is None or len(implant_mgr.implants) == 0:
+            QMessageBox.warning(
+                self,
+                "No Implants Planned",
+                "Please plan at least one virtual dental implant before generating a surgical guide."
+            )
+            return
+
+        implants_list = list(implant_mgr.implants.values())
+
+        # 2. Identify patient reference surface (prioritize aligned IOS scan, fallback to segmented teeth)
+        base_surface: Optional[vtk.vtkPolyData] = None
+        if self.viewport_grid.volume_view._ios_polydata is not None:
+            base_surface = self.viewport_grid.volume_view._ios_polydata
+        elif "teeth" in self.viewport_grid.volume_view._mesh_polydatas:
+            base_surface = self.viewport_grid.volume_view._mesh_polydatas["teeth"]
+        elif "mandible" in self.viewport_grid.volume_view._mesh_polydatas:
+            base_surface = self.viewport_grid.volume_view._mesh_polydatas["mandible"]
+
+        if base_surface is None or base_surface.GetNumberOfPoints() == 0:
+            QMessageBox.warning(
+                self,
+                "No Patient Dental Surface",
+                "Please import an Intraoral Scan (.stl / .ply) or load a Dental Segmentation Mask before generating the guide."
+            )
+            return
+
+        if self._guide_worker is not None and self._guide_worker.isRunning():
+            self._guide_worker.cancel()
+            self._guide_worker.wait(100)
+
+        # Lock UI
+        self.control_panel.btn_generate_guide.setEnabled(False)
+
+        # Setup modal progress
+        self.loading_dialog.setWindowTitle("Bau Medical Systems — 3D Surgical Guide Fabrication")
+        self.loading_dialog.set_progress(10, "Initializing CAD guide engine...")
+        self.loading_dialog.show()
+        self.status_bar.showMessage("Synthesizing 3D printable surgical implant guide...", 0)
+
+        # Launch async worker
+        self._guide_worker = SurgicalGuideWorker(
+            base_surface=base_surface,
+            implants=implants_list,
+            guide_thickness_mm=thickness_mm,
+            sleeve_clearance_mm=clearance_mm,
+            sleeve_outer_wall_mm=2.0,
+            sleeve_height_mm=6.0,
+            sleeve_offset_mm=2.0,
+            include_irrigation_windows=True,
+            parent=self,
+        )
+        self._guide_worker.progress_updated.connect(self._on_guide_progress)
+        self._guide_worker.guide_generated.connect(self._on_guide_complete)
+        self._guide_worker.error_occurred.connect(self._on_guide_error)
+        self._guide_worker.start()
+
+    def _on_guide_progress(self, percent: int, message: str) -> None:
+        """Updates progress dialog during surgical guide generation."""
+        self.loading_dialog.set_progress(percent, message)
+        self.status_bar.showMessage(message, 3000)
+
+    def _on_guide_complete(
+        self,
+        guide_pd: vtk.vtkPolyData,
+        volume_cm3: float,
+        area_cm2: float,
+    ) -> None:
+        """Invoked on Main Thread with synthesized surgical guide."""
+        self.loading_dialog.hide()
+        self.control_panel.btn_generate_guide.setEnabled(True)
+        self._surgical_guide_polydata = guide_pd
+
+        # Build actor on Main GUI Thread
+        guide_actor = SurgicalGuideGenerator.create_guide_actor(guide_pd)
+        self.viewport_grid.volume_view.add_surgical_guide_actor(guide_actor, guide_pd)
+
+        # Update control panel & status bar
+        implant_mgr = getattr(self.viewport_grid, 'implant_manager', None)
+        num_implants = len(implant_mgr.implants) if implant_mgr else 1
+        self.control_panel.update_guide_status(volume_cm3, area_cm2, num_implants)
+
+        self.status_bar.showMessage(
+            f"3D Surgical Guide Ready — Resin Volume: {volume_cm3:.2f} cm³, "
+            f"Surface Area: {area_cm2:.1f} cm² ({num_implants} implants)",
+            8000,
+        )
+
+    def _on_guide_error(self, error_message: str) -> None:
+        """Handles guide generation errors cleanly."""
+        self.loading_dialog.hide()
+        self.control_panel.btn_generate_guide.setEnabled(True)
+        QMessageBox.critical(
+            self,
+            "Surgical Guide Error",
+            f"Failed to generate 3D surgical guide:\n\n{error_message}"
+        )
+        self.status_bar.showMessage("Surgical guide fabrication failed.", 5000)
+
+    def _on_export_surgical_guide(self) -> None:
+        """Prompts user to save the surgical guide as a binary STL mesh."""
+        if self._surgical_guide_polydata is None or self._surgical_guide_polydata.GetNumberOfPoints() == 0:
+            QMessageBox.warning(
+                self,
+                "No Guide to Export",
+                "Please generate a 3D surgical guide before exporting."
+            )
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export 3D Printable Surgical Guide",
+            os.path.join(os.path.expanduser("~"), "surgical_guide_mandible.stl"),
+            "Stereolithography Mesh (*.stl);;All Files (*.*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            success = SurgicalGuideGenerator.export_guide_stl(file_path, self._surgical_guide_polydata)
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Export Succeeded",
+                    f"Surgical Guide successfully exported:\n\n{file_path}\n\n"
+                    "Calibrated in physical millimeters for SLA / DLP dental 3D printers."
+                )
+                self.status_bar.showMessage(f"Exported surgical guide to: {file_path}", 6000)
+            else:
+                QMessageBox.critical(self, "Export Failed", "Could not write STL file.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", f"Error exporting STL:\n\n{exc}")
+
     def closeEvent(self, event) -> None:
         """Cleanly terminates workers and releases VTK OpenGL contexts before window destruction."""
         if self._seg_worker is not None and self._seg_worker.isRunning():
@@ -929,6 +1079,10 @@ class MainWindow(QMainWindow):
         if self._icp_worker is not None and self._icp_worker.isRunning():
             self._icp_worker.cancel()
             self._icp_worker.wait(200)
+
+        if self._guide_worker is not None and self._guide_worker.isRunning():
+            self._guide_worker.cancel()
+            self._guide_worker.wait(200)
 
         if hasattr(self, 'viewport_grid') and self.viewport_grid is not None:
             self.viewport_grid.cleanup()
