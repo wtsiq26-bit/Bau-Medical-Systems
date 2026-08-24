@@ -70,7 +70,9 @@ class SegmentationWorker(QThread):
                 return
 
             extractor = SurfaceExtractor()
-            mask, spacing, origin, direction = extractor.load_segmentation_file(self.file_path)
+            mask, spacing, origin, direction = extractor.load_segmentation_file(
+                self.file_path, reference_volume=self.reference_volume
+            )
 
             if self._is_cancelled:
                 return
@@ -110,6 +112,8 @@ class SegmentationWorker(QThread):
                     return
 
                 if polydata.GetNumberOfPoints() > 0:
+                    if self.reference_volume is not None:
+                        extractor.validate_spatial_bounds(polydata, self.reference_volume)
                     extracted_dict[struct_id] = polydata
                     self.structure_extracted.emit(struct_id, polydata)
 

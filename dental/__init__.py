@@ -19,6 +19,7 @@ from dental.surface_extractor import (
     MANDIBULAR_CANAL,
     TEETH_ENAMEL,
     SOFT_TISSUE,
+    CoordinateAlignmentError,
 )
 from dental.mesh_registration import (
     MeshRegistrationEngine,
@@ -43,6 +44,7 @@ __all__ = [
     "MANDIBULAR_CANAL",
     "TEETH_ENAMEL",
     "SOFT_TISSUE",
+    "CoordinateAlignmentError",
     "MeshRegistrationEngine",
     "RegistrationResult",
 ]

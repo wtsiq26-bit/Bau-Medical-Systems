@@ -2,30 +2,63 @@
 Bau Medical Systems - Dental CBCT 3D DICOM Viewer
 Module: dental/surface_extractor.py
 
-Multi-Label Anatomical Surface Extraction Engine.
+Multi-Label Anatomical Surface Extraction & Coordinate Alignment Engine.
 Converts NIfTI/NRRD segmentation masks into smooth, medical-grade VTK PolyData
-meshes with clinically calibrated rendering materials.
+meshes rigorously mapped into the Patient World LPS (Left-Posterior-Superior)
+Coordinate Space.
 
-Pipeline (derived from SlicerAutomatedDentalTools):
-  vtkDiscreteMarchingCubes → vtkWindowedSincPolyDataFilter
-  → vtkQuadricDecimation (50 %) → vtkPolyDataNormals
+Mathematical Formulation:
+-------------------------
+A discrete segmentation mask has voxel index coordinates:
+    p_voxel = [i, j, k]^T  where i in [0, Nx-1], j in [0, Ny-1], k in [0, Nz-1]
 
-Thread Safety Note:
-  Surface extraction algorithms (Marching Cubes, smoothing, decimation, transforms)
-  operate purely on vtkImageData / vtkPolyData and can be safely executed inside
-  background worker threads (QThread). vtkActor and vtkPolyDataMapper creation
-  must only be performed on the Main GUI Thread via `create_structure_actor()`.
+The full 4x4 Homogeneous Affine Transformation Matrix T_LPS transforming
+continuous voxel index coordinates to Patient World LPS (x, y, z) is:
+
+    T_LPS = [ D00*sx   D01*sy   D02*sz   ox ]
+            [ D10*sx   D11*sy   D12*sz   oy ]
+            [ D20*sx   D21*sy   D22*sz   oz ]
+            [    0        0        0      1 ]
+
+where:
+  - D is the 3x3 Direction Cosines matrix (row-major order from SimpleITK/DICOM).
+  - s = (sx, sy, sz) is the physical voxel spacing in mm.
+  - o = (ox, oy, oz) is the physical origin in mm.
+
+Pipeline:
+---------
+  1. Discrete Voxel Iso-Surface: vtkDiscreteMarchingCubes on unit-scaled vtkImageData.
+  2. Windowed-Sinc Smoothing: vtkWindowedSincPolyDataFilter.
+  3. Quadric Decimation: vtkQuadricDecimation (50% target reduction).
+  4. Physical LPS Affine Transform: vtkTransformPolyDataFilter applying T_LPS.
+  5. Consistent Outward Normals: vtkPolyDataNormals computed AFTER affine mapping
+     to guarantee correct face normal orientation under all matrix determinants.
+  6. Spatial Bounding Box & Centroid Validation against reference VolumeData.
 """
 
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 import numpy as np
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk
+
+from core.volume_data import VolumeData
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Custom Coordinate Alignment Exception
+# ---------------------------------------------------------------------------
+
+class CoordinateAlignmentError(ValueError):
+    """Raised when an extracted anatomical mesh is spatially incongruent with reference volume."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -118,36 +151,38 @@ STRUCTURE_PRESETS: Dict[str, AnatomicalPreset] = {
 
 
 # ---------------------------------------------------------------------------
-# Surface Extractor
+# Surface Extractor Engine
 # ---------------------------------------------------------------------------
 
 class SurfaceExtractor:
     """
-    Converts integer-labeled segmentation masks into smooth VTK PolyData
-    meshes and provides helper methods for medical-grade Phong shading actors.
+    High-precision anatomical surface extraction engine converting segmentation
+    masks into smooth VTK PolyData meshes aligned with LPS World Coordinates.
     """
 
     # ------------------------------------------------------------------
-    # File I/O
+    # File I/O & Resampling
     # ------------------------------------------------------------------
 
     @staticmethod
     def load_segmentation_file(
         file_path: str,
+        reference_volume: Optional[VolumeData] = None,
     ) -> Tuple[np.ndarray, Tuple[float, float, float], Tuple[float, float, float], Tuple[float, ...]]:
         """
         Load a segmentation mask from NIfTI (.nii / .nii.gz) or NRRD (.nrrd).
+        Optionally resamples the mask onto a reference VolumeData grid if provided.
 
         Returns
         -------
         mask : np.ndarray
-            Integer label array in (Z, Y, X) order.
+            Integer label array in (Z, Y, X) order, C-contiguous.
         spacing : (float, float, float)
-            Voxel size in mm — (sx, sy, sz) matching VTK X, Y, Z axes.
+            Voxel size in mm — (sx, sy, sz).
         origin : (float, float, float)
             World-space origin — (ox, oy, oz).
         direction : tuple of 9 floats
-            3×3 direction cosine matrix flattened in row-major order.
+            3x3 direction cosine matrix flattened in row-major order.
         """
         try:
             import SimpleITK as sitk
@@ -161,13 +196,120 @@ class SurfaceExtractor:
             raise FileNotFoundError(f"Segmentation file not found: {file_path}")
 
         sitk_img = sitk.ReadImage(file_path)
-        mask = sitk.GetArrayFromImage(sitk_img).astype(np.int32)  # (Z, Y, X)
 
-        spacing = tuple(float(s) for s in sitk_img.GetSpacing())      # (sx, sy, sz)
-        origin  = tuple(float(o) for o in sitk_img.GetOrigin())       # (ox, oy, oz)
-        direction = tuple(float(d) for d in sitk_img.GetDirection())  # 9 floats
+        # Optional reference grid resampling
+        if reference_volume is not None:
+            # Check if resampling is needed
+            ref_size = (reference_volume.nx, reference_volume.ny, reference_volume.nz)
+            ref_spacing = reference_volume.spacing
+            ref_origin = reference_volume.origin
+            ref_direction = reference_volume.direction
+
+            needs_resampling = (
+                sitk_img.GetSize() != ref_size
+                or not np.allclose(sitk_img.GetSpacing(), ref_spacing, atol=1e-4)
+                or not np.allclose(sitk_img.GetOrigin(), ref_origin, atol=1e-3)
+                or not np.allclose(sitk_img.GetDirection(), ref_direction, atol=1e-4)
+            )
+
+            if needs_resampling:
+                logger.info("Resampling segmentation mask to match reference VolumeData grid...")
+                sitk_img = SurfaceExtractor.resample_mask_to_reference(sitk_img, reference_volume)
+
+        mask = sitk.GetArrayFromImage(sitk_img).astype(np.int32)
+        mask = np.ascontiguousarray(mask)
+
+        spacing = tuple(float(s) for s in sitk_img.GetSpacing())
+        origin  = tuple(float(o) for o in sitk_img.GetOrigin())
+        direction = tuple(float(d) for d in sitk_img.GetDirection())
 
         return mask, spacing, origin, direction
+
+    @staticmethod
+    def resample_mask_to_reference(
+        mask_image: Any,
+        reference_volume: VolumeData,
+    ) -> Any:
+        """
+        Resamples a SimpleITK segmentation mask image onto the exact physical grid
+        of the reference VolumeData using nearest-neighbor interpolation to preserve
+        integer label boundaries.
+        """
+        import SimpleITK as sitk
+
+        resample = sitk.ResampleImageFilter()
+        resample.SetSize([reference_volume.nx, reference_volume.ny, reference_volume.nz])
+        resample.SetOutputSpacing(list(reference_volume.spacing))
+        resample.SetOutputOrigin(list(reference_volume.origin))
+        resample.SetOutputDirection(list(reference_volume.direction))
+        resample.SetInterpolator(sitk.sitkNearestNeighbor)
+        resample.SetDefaultPixelValue(0)
+        resample.SetOutputPixelType(sitk.sitkInt32)
+
+        return resample.Execute(mask_image)
+
+    # ------------------------------------------------------------------
+    # Affine Matrix Construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def construct_index_to_lps_matrix(
+        spacing: Tuple[float, float, float],
+        origin: Tuple[float, float, float],
+        direction: Tuple[float, ...],
+    ) -> vtk.vtkMatrix4x4:
+        """
+        Constructs the exact 4x4 Homogeneous Affine Transformation Matrix T_LPS
+        mapping continuous voxel indices [i, j, k, 1]^T to Patient LPS World [x, y, z, 1]^T:
+
+            T_LPS = [ D00*sx   D01*sy   D02*sz   ox ]
+                    [ D10*sx   D11*sy   D12*sz   oy ]
+                    [ D20*sx   D21*sy   D22*sz   oz ]
+                    [    0        0        0      1 ]
+
+        Parameters
+        ----------
+        spacing : (sx, sy, sz)
+            Voxel spacing in mm.
+        origin : (ox, oy, oz)
+            Physical origin in mm.
+        direction : 9 floats
+            3x3 direction matrix in row-major order: (D00, D01, D02, D10, D11, D12, D20, D21, D22).
+
+        Returns
+        -------
+        vtk.vtkMatrix4x4
+        """
+        mat = vtk.vtkMatrix4x4()
+        sx, sy, sz = spacing
+        ox, oy, oz = origin
+        d = direction if (direction is not None and len(direction) == 9) else (1,0,0, 0,1,0, 0,0,1)
+
+        # Column 0: X vector scaled by sx
+        mat.SetElement(0, 0, d[0] * sx)
+        mat.SetElement(1, 0, d[3] * sx)
+        mat.SetElement(2, 0, d[6] * sx)
+        mat.SetElement(3, 0, 0.0)
+
+        # Column 1: Y vector scaled by sy
+        mat.SetElement(0, 1, d[1] * sy)
+        mat.SetElement(1, 1, d[4] * sy)
+        mat.SetElement(2, 1, d[7] * sy)
+        mat.SetElement(3, 0, 0.0)
+
+        # Column 2: Z vector scaled by sz
+        mat.SetElement(0, 2, d[2] * sz)
+        mat.SetElement(1, 2, d[5] * sz)
+        mat.SetElement(2, 2, d[8] * sz)
+        mat.SetElement(3, 0, 0.0)
+
+        # Column 3: Translation Origin
+        mat.SetElement(0, 3, ox)
+        mat.SetElement(1, 3, oy)
+        mat.SetElement(2, 3, oz)
+        mat.SetElement(3, 3, 1.0)
+
+        return mat
 
     # ------------------------------------------------------------------
     # Pure PolyData Surface Extraction (Worker-Thread Safe)
@@ -182,53 +324,55 @@ class SurfaceExtractor:
         preset: AnatomicalPreset,
     ) -> vtk.vtkPolyData:
         """
-        Extract a single anatomical structure from a labeled mask as a pure vtkPolyData.
-        This function is thread-safe and creates NO vtkActor or OpenGL objects.
+        Extract a single anatomical structure from a labeled mask as a pure vtkPolyData
+        in Patient World LPS coordinates.
+
+        Thread-safe: creates NO vtkActor, vtkRenderer, or OpenGL objects.
 
         Parameters
         ----------
         mask : np.ndarray
-            Integer label volume (Z, Y, X).
+            Integer label volume (Z, Y, X), C-contiguous.
         spacing : (sx, sy, sz)
             Voxel spacing in mm.
         origin : (ox, oy, oz)
-            Physical origin.
-        direction : tuple[float, ...]
-            9-element direction cosine matrix (row-major).
+            Physical origin in mm.
+        direction : tuple of 9 floats
+            3x3 direction cosine matrix in row-major order.
         preset : AnatomicalPreset
-            Rendering preset for this structure.
+            Rendering and smoothing preset for this structure.
 
         Returns
         -------
-        vtkPolyData
-            Underlying triangulated, smoothed, and decimated surface mesh.
+        vtk.vtkPolyData
+            Triangulated, smoothed, decimated, and LPS-transformed surface mesh.
         """
-        # ---- 1. Pack numpy mask into vtkImageData ----
+        # ---- 1. Build Unit-Scaled Voxel-Index vtkImageData ----
+        # Using unit spacing (1,1,1) and zero origin (0,0,0) ensures Marching Cubes
+        # operates in pure continuous voxel index space [0, Nx-1] x [0, Ny-1] x [0, Nz-1].
         nz, ny, nx = mask.shape
         vtk_image = vtk.vtkImageData()
         vtk_image.SetDimensions(nx, ny, nz)
-        vtk_image.SetSpacing(spacing[0], spacing[1], spacing[2])
-        vtk_image.SetOrigin(origin[0], origin[1], origin[2])
+        vtk_image.SetSpacing(1.0, 1.0, 1.0)
+        vtk_image.SetOrigin(0.0, 0.0, 0.0)
 
-        # Flatten in VTK scalar order (X-fast, then Y, then Z) — identical
-        # to NumPy C-contiguous (Z, Y, X) flattened view.
-        flat = np.ascontiguousarray(mask).ravel()
+        flat = np.ascontiguousarray(mask, dtype=np.int32).ravel()
         vtk_arr = numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_INT)
         vtk_arr.SetName("Labels")
         vtk_image.GetPointData().SetScalars(vtk_arr)
 
-        # ---- 2. Discrete Marching Cubes (label iso-surface) ----
+        # ---- 2. Discrete Marching Cubes (Voxel-Space Iso-Surface) ----
         marching = vtk.vtkDiscreteMarchingCubes()
         marching.SetInputData(vtk_image)
         marching.SetValue(0, float(preset.label_value))
-        marching.ComputeNormalsOff()       # Normals recomputed after smoothing
+        marching.ComputeNormalsOff()
         marching.ComputeGradientsOff()
         marching.Update()
 
         if marching.GetOutput().GetNumberOfPoints() == 0:
             return vtk.vtkPolyData()
 
-        # ---- 3. Windowed-Sinc Smoothing ----
+        # ---- 3. Windowed-Sinc Smoothing in Voxel Space ----
         smoother = vtk.vtkWindowedSincPolyDataFilter()
         smoother.SetInputConnection(marching.GetOutputPort())
         smoother.SetNumberOfIterations(preset.smoothing_iterations)
@@ -239,16 +383,30 @@ class SurfaceExtractor:
         smoother.NormalizeCoordinatesOn()
         smoother.Update()
 
-        # ---- 4. Quadric Decimation (real-time 60 FPS target) ----
+        # ---- 4. Quadric Decimation (50% Triangle Reduction) ----
         decimator = vtk.vtkQuadricDecimation()
         decimator.SetInputConnection(smoother.GetOutputPort())
         decimator.SetTargetReduction(preset.decimation_target)
         decimator.VolumePreservationOn()
         decimator.Update()
 
-        # ---- 5. Recompute Surface Normals ----
+        # ---- 5. Physical LPS Affine Transformation (Rigorous Spatial Mapping) ----
+        # Applies full homogeneous 4x4 matrix T_LPS:
+        # p_world = D * (s * p_voxel) + origin
+        t_lps = SurfaceExtractor.construct_index_to_lps_matrix(spacing, origin, direction)
+        vtk_transform = vtk.vtkTransform()
+        vtk_transform.SetMatrix(t_lps)
+
+        transform_filter = vtk.vtkTransformPolyDataFilter()
+        transform_filter.SetInputConnection(decimator.GetOutputPort())
+        transform_filter.SetTransform(vtk_transform)
+        transform_filter.Update()
+
+        # ---- 6. Recompute Consistent Surface Normals in World LPS Space ----
+        # Normals must be computed AFTER the affine transform to guarantee outward
+        # pointing normals under arbitrary direction cosine determinants (e.g. reflections).
         normals = vtk.vtkPolyDataNormals()
-        normals.SetInputConnection(decimator.GetOutputPort())
+        normals.SetInputConnection(transform_filter.GetOutputPort())
         normals.SetFeatureAngle(60.0)
         normals.ConsistencyOn()
         normals.SplittingOff()
@@ -257,45 +415,66 @@ class SurfaceExtractor:
         normals.ComputeCellNormalsOff()
         normals.Update()
 
-        extracted_pd: vtk.vtkPolyData = normals.GetOutput()
+        final_pd = vtk.vtkPolyData()
+        final_pd.DeepCopy(normals.GetOutput())
+        return final_pd
 
-        # ---- 6. Apply Direction Cosine Transform (LPS alignment) ----
-        dir_mat = np.array(direction[:9], dtype=np.float64).reshape(3, 3)
-        is_identity = np.allclose(dir_mat, np.eye(3), atol=1e-6)
+    # ------------------------------------------------------------------
+    # Spatial Bounding Box & Centroid Validation
+    # ------------------------------------------------------------------
 
-        if not is_identity:
-            vtk_transform = vtk.vtkTransform()
-            mat4 = vtk.vtkMatrix4x4()
-            for r in range(3):
-                for c in range(3):
-                    mat4.SetElement(r, c, dir_mat[r, c])
-            mat4.SetElement(0, 3, 0.0)
-            mat4.SetElement(1, 3, 0.0)
-            mat4.SetElement(2, 3, 0.0)
-            vtk_transform.SetMatrix(mat4)
+    @staticmethod
+    def validate_spatial_bounds(
+        mesh_polydata: vtk.vtkPolyData,
+        reference_volume: VolumeData,
+        max_allowable_drift_mm: float = 150.0,
+    ) -> bool:
+        """
+        Validates that the extracted mesh spatial bounding box and centroid are physically
+        congruent with the active reference VolumeData.
 
-            pre_translate = vtk.vtkTransform()
-            pre_translate.Translate(-origin[0], -origin[1], -origin[2])
+        Raises
+        ------
+        CoordinateAlignmentError
+            If the mesh centroid drifts beyond the allowable threshold from the volume.
+        """
+        if mesh_polydata.GetNumberOfPoints() == 0:
+            return True
 
-            post_translate = vtk.vtkTransform()
-            post_translate.Translate(origin[0], origin[1], origin[2])
+        # Mesh bounding box & centroid
+        mb = mesh_polydata.GetBounds()  # (xmin, xmax, ymin, ymax, zmin, zmax)
+        mesh_center = np.array([
+            (mb[0] + mb[1]) * 0.5,
+            (mb[2] + mb[3]) * 0.5,
+            (mb[4] + mb[5]) * 0.5,
+        ])
 
-            composite = vtk.vtkTransform()
-            composite.PostMultiply()
-            composite.Concatenate(pre_translate)
-            composite.Concatenate(vtk_transform)
-            composite.Concatenate(post_translate)
+        # Reference volume bounds & centroid
+        vol_center = np.array(reference_volume.get_center())
+        vol_bounds = reference_volume.get_bounds()
+        vol_diag = np.sqrt(
+            (vol_bounds[1] - vol_bounds[0]) ** 2 +
+            (vol_bounds[3] - vol_bounds[2]) ** 2 +
+            (vol_bounds[5] - vol_bounds[4]) ** 2
+        )
 
-            transform_filter = vtk.vtkTransformPolyDataFilter()
-            transform_filter.SetInputData(extracted_pd)
-            transform_filter.SetTransform(composite)
-            transform_filter.Update()
-            extracted_pd = transform_filter.GetOutput()
+        centroid_dist = float(np.linalg.norm(mesh_center - vol_center))
+        allowed_dist = max(max_allowable_drift_mm, vol_diag * 0.75)
 
-        # Return a deep copy to ensure thread safety
-        final_polydata = vtk.vtkPolyData()
-        final_polydata.DeepCopy(extracted_pd)
-        return final_polydata
+        if centroid_dist > allowed_dist:
+            err_msg = (
+                f"Spatial Misalignment Detected: Mesh centroid ({mesh_center[0]:.1f}, {mesh_center[1]:.1f}, {mesh_center[2]:.1f}) mm "
+                f"is drifted {centroid_dist:.1f} mm away from VolumeData center ({vol_center[0]:.1f}, {vol_center[1]:.1f}, {vol_center[2]:.1f}) mm. "
+                f"Allowed threshold is {allowed_dist:.1f} mm. Check NIfTI/NRRD Direction Matrix metadata."
+            )
+            logger.error(err_msg)
+            raise CoordinateAlignmentError(err_msg)
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Batch Extraction
+    # ------------------------------------------------------------------
 
     @classmethod
     def extract_all_structures_polydata(
@@ -305,6 +484,7 @@ class SurfaceExtractor:
         origin: Tuple[float, float, float],
         direction: Tuple[float, ...],
         presets: Optional[Dict[str, AnatomicalPreset]] = None,
+        reference_volume: Optional[VolumeData] = None,
     ) -> Dict[str, vtk.vtkPolyData]:
         """
         Extract all anatomical structures present in *mask* as pure vtkPolyData meshes.
@@ -319,8 +499,11 @@ class SurfaceExtractor:
         for struct_id, preset in presets.items():
             if preset.label_value not in unique_labels:
                 continue
+
             polydata = cls.extract_surface_polydata(mask, spacing, origin, direction, preset)
             if polydata.GetNumberOfPoints() > 0:
+                if reference_volume is not None:
+                    cls.validate_spatial_bounds(polydata, reference_volume)
                 results[struct_id] = polydata
 
         return results
@@ -369,9 +552,12 @@ class SurfaceExtractor:
         origin: Tuple[float, float, float],
         direction: Tuple[float, ...],
         preset: AnatomicalPreset,
+        reference_volume: Optional[VolumeData] = None,
     ) -> Tuple[vtk.vtkActor, vtk.vtkPolyData]:
         """Synchronous wrapper extracting both actor and polydata."""
         polydata = cls.extract_surface_polydata(mask, spacing, origin, direction, preset)
+        if reference_volume is not None:
+            cls.validate_spatial_bounds(polydata, reference_volume)
         actor = cls.create_structure_actor(polydata, preset)
         return actor, polydata
 
@@ -383,12 +569,15 @@ class SurfaceExtractor:
         origin: Tuple[float, float, float],
         direction: Tuple[float, ...],
         presets: Optional[Dict[str, AnatomicalPreset]] = None,
+        reference_volume: Optional[VolumeData] = None,
     ) -> Dict[str, Tuple[vtk.vtkActor, vtk.vtkPolyData]]:
         """Synchronous wrapper extracting all structures as (actor, polydata) tuples."""
         if presets is None:
             presets = STRUCTURE_PRESETS
 
-        poly_results = cls.extract_all_structures_polydata(mask, spacing, origin, direction, presets)
+        poly_results = cls.extract_all_structures_polydata(
+            mask, spacing, origin, direction, presets, reference_volume
+        )
         results: Dict[str, Tuple[vtk.vtkActor, vtk.vtkPolyData]] = {}
         for sid, pd in poly_results.items():
             preset = presets[sid]
