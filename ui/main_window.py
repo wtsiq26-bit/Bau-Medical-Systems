@@ -28,6 +28,7 @@ from PySide6.QtGui import QIcon, QPixmap, QColor
 import vtk
 from core.volume_data import VolumeData
 from core.dicom_loader import DicomLoaderWorker
+from core.async_workers import SegmentationWorker, ICPRegistrationWorker
 from ui.viewport_grid import ViewportGrid
 from ui.control_panel import ControlPanel
 from ui.series_sidebar import SeriesSidebar
@@ -109,9 +110,11 @@ class MainWindow(QMainWindow):
         self.loading_dialog = LoadingProgressDialog(self)
 
         # 3D Segmentation & Mesh Alignment state
-        self._ios_polydata = None          # Loaded IOS vtkPolyData (pre-alignment)
-        self._ios_raw_polydata = None      # Unaligned copy for re-registration
-        self._seg_structures: dict = {}    # {id: (actor, polydata)} from extraction
+        self._seg_worker: Optional[SegmentationWorker] = None
+        self._icp_worker: Optional[ICPRegistrationWorker] = None
+        self._ios_polydata: Optional[vtk.vtkPolyData] = None          # Loaded IOS vtkPolyData (pre-alignment)
+        self._ios_raw_polydata: Optional[vtk.vtkPolyData] = None      # Unaligned copy for re-registration
+        self._seg_structures: dict = {}                               # {id: vtkPolyData} from extraction
         self._has_ios_loaded: bool = False
         self._has_teeth_extracted: bool = False
 
@@ -677,11 +680,11 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     # --------------------------------------------------------------------------
-    # 3D AI Segmentation & IOS Mesh Alignment Handlers
+    # 3D AI Segmentation & IOS Mesh Alignment Handlers (Asynchronous)
     # --------------------------------------------------------------------------
 
     def _on_load_segmentation(self) -> None:
-        """Load a segmentation mask file and extract all labeled anatomical surfaces."""
+        """Asynchronously loads a segmentation mask file and extracts anatomical surfaces."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Load AI Segmentation Mask",
@@ -691,53 +694,91 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        try:
-            self.status_bar.showMessage("Loading segmentation mask...", 0)
-            QApplication.processEvents()
+        # Cancel any running segmentation worker
+        if self._seg_worker is not None and self._seg_worker.isRunning():
+            self._seg_worker.cancel()
+            self._seg_worker.wait(100)
 
-            extractor = SurfaceExtractor()
-            mask, spacing, origin, direction = extractor.load_segmentation_file(file_path)
+        # Disable triggering UI buttons to prevent race conditions
+        self.control_panel.btn_load_seg.setEnabled(False)
+        self.control_panel.set_icp_button_enabled(False)
 
-            self.status_bar.showMessage("Extracting anatomical surfaces (Marching Cubes → Smoothing → Decimation)...", 0)
-            QApplication.processEvents()
+        # Setup Progress Dialog
+        self.loading_dialog.setWindowTitle("Bau Medical Systems — Extracting AI Segmentation")
+        self.loading_dialog.set_progress(5, f"Reading {os.path.basename(file_path)}...")
+        self.loading_dialog.show()
+        self.status_bar.showMessage(f"Extracting segmentation: {os.path.basename(file_path)}...", 0)
 
-            results = extractor.extract_all_structures(mask, spacing, origin, direction)
+        # Clear existing segmented meshes on Main GUI Thread
+        self.viewport_grid.volume_view.clear_all_meshes()
+        self._seg_structures.clear()
+        self._has_teeth_extracted = False
 
-            # Clear previous meshes
-            self.viewport_grid.volume_view.clear_all_meshes()
-            self._seg_structures = results
+        # Launch background worker
+        self._seg_worker = SegmentationWorker(
+            file_path=file_path,
+            reference_volume=self.volume_data,
+            parent=self,
+        )
+        self._seg_worker.progress_updated.connect(self._on_seg_progress)
+        self._seg_worker.structure_extracted.connect(self._on_seg_structure_streamed)
+        self._seg_worker.finished_all.connect(self._on_seg_finished)
+        self._seg_worker.error_occurred.connect(self._on_seg_error)
+        self._seg_worker.start()
 
-            # Add each extracted surface to the 3D viewport
-            for struct_id, (actor, polydata) in results.items():
-                self.viewport_grid.volume_view.add_segmented_mesh(struct_id, actor, polydata)
+    def _on_seg_progress(self, percent: int, message: str) -> None:
+        """Updates progress dialog and status bar during segmentation extraction."""
+        self.loading_dialog.set_progress(percent, message)
+        self.status_bar.showMessage(message, 3000)
 
-            # Track teeth availability for ICP
-            self._has_teeth_extracted = "teeth" in results
-            self.control_panel.set_icp_button_enabled(
-                self._has_teeth_extracted and self._has_ios_loaded
-            )
+    def _on_seg_structure_streamed(self, struct_id: str, polydata: vtk.vtkPolyData) -> None:
+        """
+        Receives extracted vtkPolyData from worker thread and builds the vtkActor
+        strictly on the Main GUI Thread.
+        """
+        if polydata is None or polydata.GetNumberOfPoints() == 0:
+            return
 
-            struct_names = ", ".join(
-                STRUCTURE_PRESETS[sid].name for sid in results.keys() if sid in STRUCTURE_PRESETS
-            )
+        self._seg_structures[struct_id] = polydata
+        preset = STRUCTURE_PRESETS.get(struct_id)
+        if preset is not None:
+            actor = SurfaceExtractor.create_structure_actor(polydata, preset)
+            self.viewport_grid.volume_view.add_segmented_mesh(struct_id, actor, polydata)
+
+    def _on_seg_finished(self, results: dict) -> None:
+        """Invoked on Main Thread when all structures are extracted."""
+        self.loading_dialog.hide()
+        self.control_panel.btn_load_seg.setEnabled(True)
+
+        self._has_teeth_extracted = "teeth" in results
+        self.control_panel.set_icp_button_enabled(
+            self._has_teeth_extracted and self._has_ios_loaded
+        )
+
+        struct_names = ", ".join(
+            STRUCTURE_PRESETS[sid].name for sid in results.keys() if sid in STRUCTURE_PRESETS
+        )
+        if results:
             self.status_bar.showMessage(
                 f"Segmentation loaded: {len(results)} structures extracted ({struct_names})",
                 8000,
             )
+        else:
+            self.status_bar.showMessage("No labeled structures found in segmentation mask.", 5000)
 
-        except ImportError as e:
-            QMessageBox.critical(
-                self,
-                "Missing Dependency",
-                f"A required library is not installed:\n\n{str(e)}"
-            )
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Segmentation Load Error",
-                f"Failed to load segmentation mask:\n\n{str(e)}"
-            )
-            self.status_bar.showMessage("Segmentation load failed.", 5000)
+    def _on_seg_error(self, error_message: str) -> None:
+        """Handles worker extraction errors cleanly without freezing or crashing."""
+        self.loading_dialog.hide()
+        self.control_panel.btn_load_seg.setEnabled(True)
+        self.control_panel.set_icp_button_enabled(
+            self._has_teeth_extracted and self._has_ios_loaded
+        )
+        QMessageBox.critical(
+            self,
+            "Segmentation Extraction Error",
+            f"Failed to extract 3D surfaces from segmentation mask:\n\n{error_message}"
+        )
+        self.status_bar.showMessage("Segmentation extraction failed.", 5000)
 
     def _on_import_ios_scan(self) -> None:
         """Import an intraoral scan (STL/PLY) and display it in the 3D viewport."""
@@ -760,7 +801,7 @@ class MainWindow(QMainWindow):
             self._ios_polydata = ios_pd
             self._has_ios_loaded = True
 
-            # Create and display actor
+            # Create and display actor on Main GUI Thread
             ios_actor = engine.create_ios_actor(ios_pd)
             self.viewport_grid.volume_view.add_ios_scan_actor(ios_actor, ios_pd)
 
@@ -786,14 +827,14 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("IOS scan import failed.", 5000)
 
     def _on_run_icp_alignment(self) -> None:
-        """Run ICP registration of the IOS scan onto the CBCT teeth surface."""
+        """Asynchronously runs rigid ICP registration of the IOS scan onto CBCT teeth."""
         # Validate prerequisites
         teeth_pd = self.viewport_grid.volume_view.get_mesh_polydata("teeth")
         if teeth_pd is None or teeth_pd.GetNumberOfPoints() == 0:
             QMessageBox.warning(
                 self,
                 "No Teeth Surface",
-                "Please load a segmentation mask with teeth labels before running ICP alignment."
+                "Please load a segmentation mask containing teeth labels before running ICP alignment."
             )
             return
 
@@ -806,43 +847,85 @@ class MainWindow(QMainWindow):
             )
             return
 
-        try:
-            self.status_bar.showMessage("Running ICP registration (centroid pre-alignment → rigid body)...", 0)
-            QApplication.processEvents()
+        if self._icp_worker is not None and self._icp_worker.isRunning():
+            self._icp_worker.cancel()
+            self._icp_worker.wait(100)
 
-            engine = MeshRegistrationEngine()
-            result = engine.register_icp(
-                source=source_pd,
-                target=teeth_pd,
-                max_iterations=200,
-                max_landmarks=2000,
-                tolerance=1e-6,
-            )
+        # Lock UI controls during registration
+        self.control_panel.set_icp_button_enabled(False)
+        self.control_panel.btn_import_ios.setEnabled(False)
 
-            # Replace IOS actor with aligned version
-            self.viewport_grid.volume_view.add_ios_scan_actor(
-                result.aligned_actor, result.aligned_polydata
-            )
+        # Setup Progress Dialog
+        self.loading_dialog.setWindowTitle("Bau Medical Systems — ICP Scan Alignment")
+        self.loading_dialog.set_progress(10, "Initializing rigid 6-DoF ICP optimizer...")
+        self.loading_dialog.show()
+        self.status_bar.showMessage("Running ICP registration (Centroid Pre-Alignment → Rigid Body)...", 0)
 
-            # Update UI status
-            self.control_panel.update_icp_status(result.rms_error, result.num_iterations)
+        # Launch background worker
+        self._icp_worker = ICPRegistrationWorker(
+            source_poly=source_pd,
+            target_poly=teeth_pd,
+            max_iterations=150,
+            max_landmarks=2000,
+            tolerance=1e-6,
+            parent=self,
+        )
+        self._icp_worker.progress_updated.connect(self._on_icp_progress)
+        self._icp_worker.registration_complete.connect(self._on_icp_complete)
+        self._icp_worker.error_occurred.connect(self._on_icp_error)
+        self._icp_worker.start()
 
-            self.status_bar.showMessage(
-                f"ICP alignment converged — RMS: {result.rms_error:.4f} mm, "
-                f"Iterations: {result.num_iterations}",
-                8000,
-            )
+    def _on_icp_progress(self, percent: int, message: str) -> None:
+        """Updates progress dialog and status bar during ICP registration."""
+        self.loading_dialog.set_progress(percent, message)
+        self.status_bar.showMessage(message, 3000)
 
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "ICP Registration Error",
-                f"ICP alignment failed:\n\n{str(e)}"
-            )
-            self.status_bar.showMessage("ICP alignment failed.", 5000)
+    def _on_icp_complete(
+        self,
+        aligned_poly: vtk.vtkPolyData,
+        transform_matrix: np.ndarray,
+        rms_error: float,
+        num_iterations: int,
+    ) -> None:
+        """Invoked on Main Thread with computed registration data."""
+        self.loading_dialog.hide()
+        self.control_panel.set_icp_button_enabled(True)
+        self.control_panel.btn_import_ios.setEnabled(True)
+
+        # Build actor on Main GUI Thread
+        aligned_actor = MeshRegistrationEngine.create_ios_actor(aligned_poly)
+        self.viewport_grid.volume_view.add_ios_scan_actor(aligned_actor, aligned_poly)
+
+        # Update UI status
+        self.control_panel.update_icp_status(rms_error, num_iterations)
+        self.status_bar.showMessage(
+            f"ICP alignment converged — RMS: {rms_error:.4f} mm, "
+            f"Iterations: {num_iterations}",
+            8000,
+        )
+
+    def _on_icp_error(self, error_message: str) -> None:
+        """Handles ICP registration errors cleanly."""
+        self.loading_dialog.hide()
+        self.control_panel.set_icp_button_enabled(True)
+        self.control_panel.btn_import_ios.setEnabled(True)
+        QMessageBox.critical(
+            self,
+            "ICP Registration Error",
+            f"ICP alignment failed:\n\n{error_message}"
+        )
+        self.status_bar.showMessage("ICP alignment failed.", 5000)
 
     def closeEvent(self, event) -> None:
-        """Cleanly releases VTK OpenGL contexts before window destruction."""
+        """Cleanly terminates workers and releases VTK OpenGL contexts before window destruction."""
+        if self._seg_worker is not None and self._seg_worker.isRunning():
+            self._seg_worker.cancel()
+            self._seg_worker.wait(200)
+
+        if self._icp_worker is not None and self._icp_worker.isRunning():
+            self._icp_worker.cancel()
+            self._icp_worker.wait(200)
+
         if hasattr(self, 'viewport_grid') and self.viewport_grid is not None:
             self.viewport_grid.cleanup()
         super().closeEvent(event)

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon, QFont, QColor
 
 from core.volume_data import VolumeData
+from core.async_workers import PanoramicWorker
 from rendering.mpr_slice_view import MPRSliceView
 from rendering.volume_view import VolumeView
 from rendering.panoramic_view import PanoramicView
@@ -166,6 +167,7 @@ class ViewportGrid(QWidget):
         self.dental_arch = DentalArchCurve(step_size_mm=0.8)
         self.cross_section_mgr = CrossSectionManager(self.dental_arch)
         self.implant_manager = ImplantManager()
+        self._panoramic_worker: Optional[PanoramicWorker] = None
 
         self.active_viewport_id = "axial"
         self._current_layout_mode = "2x2"
@@ -443,14 +445,34 @@ class ViewportGrid(QWidget):
         self.signals.arch_updated.emit(len(self.dental_arch.seed_points), self.dental_arch.total_length_mm)
 
     def _update_panoramic_and_cross_sections(self) -> None:
-        """Updates Panoramic and Cross-Section viewports from current arch curve."""
+        """Updates Panoramic and Cross-Section viewports from current arch curve asynchronously."""
         if self.volume_data is None or len(self.dental_arch.sampled_points) < 2:
             return
 
-        self.panoramic_view.update_panoramic(self.volume_data, self.dental_arch)
         self.cross_section_view.set_volume_and_manager(self.volume_data, self.cross_section_mgr)
         mid_idx = len(self.dental_arch.sampled_points) // 2
         self.set_cross_section_index(mid_idx)
+
+        # Launch asynchronous panoramic reconstruction worker
+        if self._panoramic_worker is not None and self._panoramic_worker.isRunning():
+            self._panoramic_worker.cancel()
+            self._panoramic_worker.terminate()
+            self._panoramic_worker.wait(100)
+
+        vol = self.volume_data
+        arch = self.dental_arch
+        thick = self.panoramic_view.panoramic_generator.focal_trough_thickness_mm
+
+        self._panoramic_worker = PanoramicWorker(
+            volume=vol,
+            arch_curve=arch,
+            focal_trough_thickness_mm=thick,
+            parent=self,
+        )
+        self._panoramic_worker.panoramic_ready.connect(
+            lambda img_arr: self.panoramic_view.set_panoramic_image_array(img_arr, vol, arch)
+        )
+        self._panoramic_worker.start()
 
     # --------------------------------------------------------------------------
     # Synchronization & Event Handlers
@@ -636,6 +658,9 @@ class ViewportGrid(QWidget):
         self.cross_section_view._update_implant_overlays()
 
     def cleanup(self) -> None:
+        if self._panoramic_worker is not None and self._panoramic_worker.isRunning():
+            self._panoramic_worker.cancel()
+            self._panoramic_worker.wait(200)
         self.stop_cine()
         self.axial_view.cleanup()
         self.coronal_view.cleanup()

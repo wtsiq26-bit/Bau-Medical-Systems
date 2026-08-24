@@ -6,14 +6,10 @@ Intraoral Scan (IOS) ICP Registration Engine.
 Registers imported STL/PLY optical surface scans onto CBCT-extracted tooth
 surfaces using VTK's vtkIterativeClosestPointTransform.
 
-Engineering Notes:
-- Centroid pre-alignment is enabled via StartByMatchingCentroidsOn() so that
-  spatially distant scans converge reliably without a manual initial guess.
-- The landmark transform is locked to rigid-body mode (rotation + translation
-  only — no scaling or affine shear).
-- Returns the 4×4 homogeneous transformation matrix, RMS fit error, and a
-  pre-configured vtkActor with a distinctive translucent blue-teal material
-  to visually distinguish the IOS scan from CBCT surfaces.
+Thread Safety Note:
+  `register_icp_transform()` executes pure geometric algorithms (ICP transform,
+  matrix extraction, RMS metric via vtkCellLocator) and is thread-safe for background
+  worker threads (QThread). `create_ios_actor()` must be executed on the Main GUI Thread.
 """
 
 from __future__ import annotations
@@ -70,17 +66,6 @@ class MeshRegistrationEngine:
     """
     Loads and registers intraoral optical scans (IOS) onto CBCT tooth surfaces
     via rigid ICP.
-
-    Typical usage::
-
-        engine = MeshRegistrationEngine()
-        ios_pd = engine.load_mesh("scan.stl")
-        ios_actor = engine.create_ios_actor(ios_pd)
-
-        # After extracting teeth surface from segmentation:
-        result = engine.register_icp(source=ios_pd, target=teeth_polydata)
-        volume_view.remove_ios_scan_actor()
-        volume_view.add_ios_scan_actor(result.aligned_actor)
     """
 
     # ------------------------------------------------------------------
@@ -101,13 +86,6 @@ class MeshRegistrationEngine:
         -------
         vtkPolyData
             Loaded triangulated mesh.
-
-        Raises
-        ------
-        FileNotFoundError
-            If *file_path* does not exist.
-        ValueError
-            If the file extension is unsupported.
         """
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"Mesh file not found: {file_path}")
@@ -144,22 +122,25 @@ class MeshRegistrationEngine:
             normals.Update()
             polydata = normals.GetOutput()
 
-        return polydata
+        out_pd = vtk.vtkPolyData()
+        out_pd.DeepCopy(polydata)
+        return out_pd
 
     # ------------------------------------------------------------------
-    # ICP Registration
+    # Pure ICP Registration (Worker-Thread Safe)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def register_icp(
+    def register_icp_transform(
         source: vtk.vtkPolyData,
         target: vtk.vtkPolyData,
-        max_iterations: int = 200,
+        max_iterations: int = 150,
         max_landmarks: int = 2000,
         tolerance: float = 1e-6,
-    ) -> RegistrationResult:
+    ) -> Tuple[vtk.vtkPolyData, np.ndarray, float, int]:
         """
-        Perform rigid ICP alignment of *source* onto *target*.
+        Perform rigid ICP alignment of *source* onto *target* returning pure data.
+        Thread-safe for background worker execution.
 
         Parameters
         ----------
@@ -168,7 +149,7 @@ class MeshRegistrationEngine:
         target : vtkPolyData
             The CBCT-extracted tooth surface (reference frame).
         max_iterations : int
-            Maximum number of ICP iterations (default 200).
+            Maximum number of ICP iterations (default 150).
         max_landmarks : int
             Number of point correspondences sampled per iteration (default 2000).
         tolerance : float
@@ -176,9 +157,14 @@ class MeshRegistrationEngine:
 
         Returns
         -------
-        RegistrationResult
-            Contains aligned mesh, actor, 4×4 matrix, RMS error, and
-            iteration count.
+        aligned_polydata : vtkPolyData
+            Deep-copied transformed source mesh.
+        transform_matrix : np.ndarray
+            4×4 homogeneous rigid-body transformation matrix.
+        rms_error : float
+            RMS point-to-surface residual distance in mm.
+        num_iterations : int
+            Iteration count.
         """
         if source.GetNumberOfPoints() == 0:
             raise ValueError("ICP source mesh is empty (0 vertices).")
@@ -194,7 +180,7 @@ class MeshRegistrationEngine:
         icp.SetMaximumMeanDistance(tolerance)
         icp.SetCheckMeanDistance(1)
 
-        # Engineering Refinement #2: centroid pre-alignment + rigid body lock
+        # Centroid pre-alignment + rigid body lock
         icp.StartByMatchingCentroidsOn()
         icp.GetLandmarkTransform().SetModeToRigidBody()
 
@@ -220,26 +206,16 @@ class MeshRegistrationEngine:
         # ---- Compute RMS residual ----
         rms = MeshRegistrationEngine._compute_rms_error(aligned_pd, target)
 
-        # ---- Build rendering actor ----
-        aligned_actor = MeshRegistrationEngine.create_ios_actor(aligned_pd)
-
-        num_iters: int = icp.GetMaximumNumberOfIterations()  # VTK doesn't expose actual; use max as upper bound
-        # Attempt to read actual iteration count if available
+        num_iters: int = icp.GetMaximumNumberOfIterations()
         try:
             num_iters = int(icp.GetNumberOfIterations())  # type: ignore[attr-defined]
         except AttributeError:
             pass
 
-        return RegistrationResult(
-            aligned_polydata=aligned_pd,
-            aligned_actor=aligned_actor,
-            transform_matrix=transform_np,
-            rms_error=rms,
-            num_iterations=num_iters,
-        )
+        return aligned_pd, transform_np, rms, num_iters
 
     # ------------------------------------------------------------------
-    # IOS Actor Factory
+    # IOS Actor Factory (Must execute on Main GUI Thread)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -247,16 +223,7 @@ class MeshRegistrationEngine:
         """
         Create a distinctive IOS scan actor with translucent blue-teal
         material to distinguish it from CBCT-extracted surfaces.
-
-        Parameters
-        ----------
-        polydata : vtkPolyData
-            The intraoral scan mesh.
-
-        Returns
-        -------
-        vtkActor
-            Configured rendering actor.
+        Must be called on the Main GUI Thread.
         """
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(polydata)
@@ -276,6 +243,32 @@ class MeshRegistrationEngine:
         prop.BackfaceCullingOff()        # IOS scans may not be watertight
 
         return actor
+
+    # ------------------------------------------------------------------
+    # Legacy / Synchronous Convenience Wrapper
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def register_icp(
+        cls,
+        source: vtk.vtkPolyData,
+        target: vtk.vtkPolyData,
+        max_iterations: int = 150,
+        max_landmarks: int = 2000,
+        tolerance: float = 1e-6,
+    ) -> RegistrationResult:
+        """Synchronous wrapper returning a RegistrationResult with actor attached."""
+        aligned_pd, transform_np, rms, iters = cls.register_icp_transform(
+            source, target, max_iterations, max_landmarks, tolerance
+        )
+        aligned_actor = cls.create_ios_actor(aligned_pd)
+        return RegistrationResult(
+            aligned_polydata=aligned_pd,
+            aligned_actor=aligned_actor,
+            transform_matrix=transform_np,
+            rms_error=rms,
+            num_iterations=iters,
+        )
 
     # ------------------------------------------------------------------
     # Internal Helpers

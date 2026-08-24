@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import math
 import numpy as np
 import vtk
+from vtk.util.numpy_support import numpy_to_vtk
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QFrame
 
@@ -205,6 +206,41 @@ class PanoramicView(QFrame):
             return
 
         self.color_map.SetInputData(vtk_img)
+        self.color_map.Update()
+
+        self._reset_camera()
+        self.cursor_actor.VisibilityOn()
+        self._update_cursor_line()
+        self._update_hud_text()
+        self.safe_render()
+
+    def set_panoramic_image_array(
+        self,
+        img_arr: np.ndarray,
+        volume: VolumeData,
+        arch_curve: DentalArchCurve,
+    ) -> None:
+        """
+        Receives an asynchronously computed 2D HU image matrix from PanoramicWorker
+        and updates the VTK display pipeline on the GUI thread.
+        """
+        self.volume_data = volume
+        self.arch_curve = arch_curve
+
+        if img_arr is None or img_arr.size == 0:
+            return
+
+        h, w = img_arr.shape
+        vtk_image = vtk.vtkImageData()
+        vtk_image.SetDimensions(w, h, 1)
+        vtk_image.SetSpacing(arch_curve.step_size_mm, self.panoramic_generator.vertical_step_mm, 1.0)
+        vtk_image.SetOrigin(0.0, 0.0, 0.0)
+
+        flat_arr = np.ascontiguousarray(img_arr.ravel(), dtype=np.int16)
+        vtk_scalars = numpy_to_vtk(flat_arr, deep=True, array_type=vtk.VTK_SHORT)
+        vtk_image.GetPointData().SetScalars(vtk_scalars)
+
+        self.color_map.SetInputData(vtk_image)
         self.color_map.Update()
 
         self._reset_camera()

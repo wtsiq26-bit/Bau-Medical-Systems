@@ -10,20 +10,18 @@ Pipeline (derived from SlicerAutomatedDentalTools):
   vtkDiscreteMarchingCubes → vtkWindowedSincPolyDataFilter
   → vtkQuadricDecimation (50 %) → vtkPolyDataNormals
 
-Engineering Notes:
-- SimpleITK direction cosines are decomposed into a 3×3 rotation matrix and
-  applied via vtkTransformPolyDataFilter so that the extracted surface lives
-  in the same LPS physical coordinate frame as VolumeData.vtk_image_data.
-- Each anatomical structure is assigned a distinct AnatomicalPreset defining
-  the Marching-Cubes label, RGB color, opacity, Phong shading coefficients,
-  and smoothing intensity.
+Thread Safety Note:
+  Surface extraction algorithms (Marching Cubes, smoothing, decimation, transforms)
+  operate purely on vtkImageData / vtkPolyData and can be safely executed inside
+  background worker threads (QThread). vtkActor and vtkPolyDataMapper creation
+  must only be performed on the Main GUI Thread via `create_structure_actor()`.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import vtk
@@ -126,15 +124,7 @@ STRUCTURE_PRESETS: Dict[str, AnatomicalPreset] = {
 class SurfaceExtractor:
     """
     Converts integer-labeled segmentation masks into smooth VTK PolyData
-    meshes with medical-grade Phong shading materials.
-
-    Typical usage::
-
-        extractor = SurfaceExtractor()
-        mask, spacing, origin, direction = extractor.load_segmentation_file("seg.nii.gz")
-        results = extractor.extract_all_structures(mask, spacing, origin, direction)
-        for name, (actor, polydata) in results.items():
-            volume_view.add_segmented_mesh(name, actor)
+    meshes and provides helper methods for medical-grade Phong shading actors.
     """
 
     # ------------------------------------------------------------------
@@ -180,19 +170,20 @@ class SurfaceExtractor:
         return mask, spacing, origin, direction
 
     # ------------------------------------------------------------------
-    # Single-Structure Extraction
+    # Pure PolyData Surface Extraction (Worker-Thread Safe)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def extract_surface(
+    def extract_surface_polydata(
         mask: np.ndarray,
         spacing: Tuple[float, float, float],
         origin: Tuple[float, float, float],
         direction: Tuple[float, ...],
         preset: AnatomicalPreset,
-    ) -> Tuple[vtk.vtkActor, vtk.vtkPolyData]:
+    ) -> vtk.vtkPolyData:
         """
-        Extract a single anatomical structure from a labeled mask.
+        Extract a single anatomical structure from a labeled mask as a pure vtkPolyData.
+        This function is thread-safe and creates NO vtkActor or OpenGL objects.
 
         Parameters
         ----------
@@ -209,12 +200,9 @@ class SurfaceExtractor:
 
         Returns
         -------
-        actor : vtkActor
-            Fully shaded actor ready for rendering.
-        polydata : vtkPolyData
-            Underlying triangulated surface mesh.
+        vtkPolyData
+            Underlying triangulated, smoothed, and decimated surface mesh.
         """
-
         # ---- 1. Pack numpy mask into vtkImageData ----
         nz, ny, nx = mask.shape
         vtk_image = vtk.vtkImageData()
@@ -238,13 +226,7 @@ class SurfaceExtractor:
         marching.Update()
 
         if marching.GetOutput().GetNumberOfPoints() == 0:
-            # Label not found — return empty actor
-            empty_pd = vtk.vtkPolyData()
-            empty_actor = vtk.vtkActor()
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(empty_pd)
-            empty_actor.SetMapper(mapper)
-            return empty_actor, empty_pd
+            return vtk.vtkPolyData()
 
         # ---- 3. Windowed-Sinc Smoothing ----
         smoother = vtk.vtkWindowedSincPolyDataFilter()
@@ -278,9 +260,6 @@ class SurfaceExtractor:
         extracted_pd: vtk.vtkPolyData = normals.GetOutput()
 
         # ---- 6. Apply Direction Cosine Transform (LPS alignment) ----
-        # SimpleITK direction is a 3×3 matrix stored row-major.
-        # If it is not the identity, apply a vtkTransform so the mesh
-        # lives in the same LPS coordinate frame as VolumeData.
         dir_mat = np.array(direction[:9], dtype=np.float64).reshape(3, 3)
         is_identity = np.allclose(dir_mat, np.eye(3), atol=1e-6)
 
@@ -290,14 +269,11 @@ class SurfaceExtractor:
             for r in range(3):
                 for c in range(3):
                     mat4.SetElement(r, c, dir_mat[r, c])
-            # Translation is already baked into the origin; direction
-            # rotation must pivot about the origin.
             mat4.SetElement(0, 3, 0.0)
             mat4.SetElement(1, 3, 0.0)
             mat4.SetElement(2, 3, 0.0)
             vtk_transform.SetMatrix(mat4)
 
-            # Temporarily shift origin to world-origin, rotate, shift back
             pre_translate = vtk.vtkTransform()
             pre_translate.Translate(-origin[0], -origin[1], -origin[2])
 
@@ -316,9 +292,54 @@ class SurfaceExtractor:
             transform_filter.Update()
             extracted_pd = transform_filter.GetOutput()
 
-        # ---- 7. Build Rendering Actor with Medical Material ----
+        # Return a deep copy to ensure thread safety
+        final_polydata = vtk.vtkPolyData()
+        final_polydata.DeepCopy(extracted_pd)
+        return final_polydata
+
+    @classmethod
+    def extract_all_structures_polydata(
+        cls,
+        mask: np.ndarray,
+        spacing: Tuple[float, float, float],
+        origin: Tuple[float, float, float],
+        direction: Tuple[float, ...],
+        presets: Optional[Dict[str, AnatomicalPreset]] = None,
+    ) -> Dict[str, vtk.vtkPolyData]:
+        """
+        Extract all anatomical structures present in *mask* as pure vtkPolyData meshes.
+        Thread-safe for background worker execution.
+        """
+        if presets is None:
+            presets = STRUCTURE_PRESETS
+
+        unique_labels = set(np.unique(mask).tolist())
+        results: Dict[str, vtk.vtkPolyData] = {}
+
+        for struct_id, preset in presets.items():
+            if preset.label_value not in unique_labels:
+                continue
+            polydata = cls.extract_surface_polydata(mask, spacing, origin, direction, preset)
+            if polydata.GetNumberOfPoints() > 0:
+                results[struct_id] = polydata
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Actor Creation (Must execute on Main GUI Thread)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def create_structure_actor(
+        polydata: vtk.vtkPolyData,
+        preset: AnatomicalPreset,
+    ) -> vtk.vtkActor:
+        """
+        Constructs a fully configured vtkActor for *polydata* using *preset*.
+        Must be called on the Main GUI Thread.
+        """
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(extracted_pd)
+        mapper.SetInputData(polydata)
         mapper.ScalarVisibilityOff()
 
         actor = vtk.vtkActor()
@@ -332,15 +353,27 @@ class SurfaceExtractor:
         prop.SetSpecular(preset.specular)
         prop.SetSpecularPower(preset.specular_power)
         prop.SetInterpolationToPhong()
-
-        # Back-face culling for watertight anatomy
         prop.BackfaceCullingOn()
 
-        return actor, extracted_pd
+        return actor
 
     # ------------------------------------------------------------------
-    # Batch Extraction (all labeled structures)
+    # Legacy / Synchronous Convenience Wrappers
     # ------------------------------------------------------------------
+
+    @classmethod
+    def extract_surface(
+        cls,
+        mask: np.ndarray,
+        spacing: Tuple[float, float, float],
+        origin: Tuple[float, float, float],
+        direction: Tuple[float, ...],
+        preset: AnatomicalPreset,
+    ) -> Tuple[vtk.vtkActor, vtk.vtkPolyData]:
+        """Synchronous wrapper extracting both actor and polydata."""
+        polydata = cls.extract_surface_polydata(mask, spacing, origin, direction, preset)
+        actor = cls.create_structure_actor(polydata, preset)
+        return actor, polydata
 
     @classmethod
     def extract_all_structures(
@@ -351,37 +384,15 @@ class SurfaceExtractor:
         direction: Tuple[float, ...],
         presets: Optional[Dict[str, AnatomicalPreset]] = None,
     ) -> Dict[str, Tuple[vtk.vtkActor, vtk.vtkPolyData]]:
-        """
-        Extract all anatomical structures present in *mask*.
-
-        Only presets whose label value is actually found in the mask are
-        processed.  Returns a dictionary keyed by structure id (e.g.
-        ``"mandible"``, ``"teeth"``).
-
-        Parameters
-        ----------
-        mask : np.ndarray
-            Integer label volume (Z, Y, X).
-        spacing, origin, direction
-            Physical coordinate parameters from ``load_segmentation_file``.
-        presets : dict, optional
-            Override default ``STRUCTURE_PRESETS``.
-
-        Returns
-        -------
-        dict[str, (vtkActor, vtkPolyData)]
-        """
+        """Synchronous wrapper extracting all structures as (actor, polydata) tuples."""
         if presets is None:
             presets = STRUCTURE_PRESETS
 
-        unique_labels = set(np.unique(mask).tolist())
+        poly_results = cls.extract_all_structures_polydata(mask, spacing, origin, direction, presets)
         results: Dict[str, Tuple[vtk.vtkActor, vtk.vtkPolyData]] = {}
-
-        for struct_id, preset in presets.items():
-            if preset.label_value not in unique_labels:
-                continue
-            actor, polydata = cls.extract_surface(mask, spacing, origin, direction, preset)
-            if polydata.GetNumberOfPoints() > 0:
-                results[struct_id] = (actor, polydata)
+        for sid, pd in poly_results.items():
+            preset = presets[sid]
+            actor = cls.create_structure_actor(pd, preset)
+            results[sid] = (actor, pd)
 
         return results
